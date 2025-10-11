@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
-import { Mic, MicOff, Volume2, Settings, Languages, Wifi, WifiOff } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, Languages, Wifi, WifiOff } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { translateText } from '@/services/translation';
+import { TTSService } from '@/services/tts';
 import { getConfig } from '@/config/app-config';
 
 interface TranslationSegment {
@@ -15,10 +16,18 @@ interface TranslationSegment {
 }
 
 interface EarsMessage {
-  type: 'transcription' | 'interim' | 'error';
+  type: 'word' | 'final' | 'error' | 'whisper_processing' | 'whisper_complete';
+  word?: string;
+  start_time?: number;
+  end_time?: number | null;
   text?: string;
-  is_final?: boolean;
-  error?: string;
+  words?: Array<{ word: string; start_time: number; end_time: number | null }>;
+  message?: string;
+  sentence_id?: string;
+  original_text?: string;
+  corrected_text?: string;
+  confidence?: number;
+  changed?: boolean;
 }
 
 const TranslationApp = () => {
@@ -30,9 +39,24 @@ const TranslationApp = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('Disconnected');
-  const [isTranslating, setIsTranslating] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [isTtsConnected, setIsTtsConnected] = useState(false);
+
   const websocket = useRef<WebSocket | null>(null);
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttempts = useRef<number>(0);
+  const maxReconnectAttempts = 5;
+  const audioContext = useRef<AudioContext | null>(null);
+  const mediaStream = useRef<MediaStream | null>(null);
+  const audioProcessor = useRef<ScriptProcessorNode | null>(null);
+  const pendingTranslations = useRef<Set<string>>(new Set());
+  const originalScrollRef = useRef<HTMLDivElement>(null);
+  const translationScrollRef = useRef<HTMLDivElement>(null);
+  const translationTimer = useRef<NodeJS.Timeout | null>(null);
+  const originalLanguageRef = useRef<string>(originalLanguage);
+  const targetLanguageRef = useRef<string>(targetLanguage);
+  const ttsService = useRef<TTSService | null>(null);
+  const ttsEnabledRef = useRef<boolean>(false);
   const config = getConfig();
 
   const languages = [
@@ -51,8 +75,13 @@ const TranslationApp = () => {
   ];
 
   const connectWebSocket = () => {
-    if (websocket.current?.readyState === WebSocket.OPEN) {
+    if (websocket.current?.readyState === WebSocket.OPEN || websocket.current?.readyState === WebSocket.CONNECTING) {
       return;
+    }
+
+    if (websocket.current) {
+      websocket.current.close();
+      websocket.current = null;
     }
 
     try {
@@ -62,6 +91,7 @@ const TranslationApp = () => {
       websocket.current.onopen = () => {
         setIsConnected(true);
         setConnectionStatus('Connected');
+        reconnectAttempts.current = 0;
         console.log('Connected to ears WebSocket server');
       };
       
@@ -80,9 +110,17 @@ const TranslationApp = () => {
         setConnectionStatus('Disconnected');
         console.log('Disconnected from ears WebSocket server');
         
-        reconnectTimeout.current = setTimeout(() => {
-          connectWebSocket();
-        }, 3000);
+        if (reconnectAttempts.current < maxReconnectAttempts) {
+          const backoffDelay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 30000);
+          reconnectAttempts.current += 1;
+          setConnectionStatus(`Reconnecting in ${backoffDelay/1000}s (attempt ${reconnectAttempts.current}/${maxReconnectAttempts})...`);
+          
+          reconnectTimeout.current = setTimeout(() => {
+            connectWebSocket();
+          }, backoffDelay);
+        } else {
+          setConnectionStatus('Max reconnection attempts reached. Click to retry.');
+        }
       };
       
       websocket.current.onerror = (error) => {
@@ -95,46 +133,153 @@ const TranslationApp = () => {
     }
   };
 
-  const handleEarsMessage = async (message: EarsMessage) => {
-    if (message.type === 'error') {
-      console.error('Ears error:', message.error);
-      return;
+  const detectSentenceEnd = (text: string): boolean => {
+    return /[.!?。！？]\s*$/.test(text.trim());
+  };
+
+  const countWords = (text: string): number => {
+    return text.trim().split(/\s+/).filter(word => word.length > 0).length;
+  };
+
+  const shouldTriggerTranslation = (text: string): boolean => {
+    return detectSentenceEnd(text) || countWords(text) >= config.translationMaxWords;
+  };
+
+  const resetTranslationTimer = () => {
+    if (translationTimer.current) {
+      clearTimeout(translationTimer.current);
+      translationTimer.current = null;
     }
+  };
 
-    if (message.type === 'interim' && message.text) {
-      setCurrentOriginal(message.text);
-      return;
-    }
-
-    if (message.type === 'transcription' && message.is_final && message.text) {
-      const transcribedText = message.text;
-      setCurrentOriginal('');
-      setIsTranslating(true);
-      
-      try {
-        const languageName = languages.find(l => l.code === targetLanguage)?.name || targetLanguage;
-        const result = await translateText({
-          text: transcribedText,
-          sourceLanguage: originalLanguage,
-          targetLanguage: languageName,
-        });
-
-        if (result.error) {
-          console.error('Translation error:', result.error);
-          return;
-        }
-
-        setSegments(prev => [...prev, {
-          id: Date.now().toString(),
-          original: transcribedText,
-          translated: result.translatedText,
+  const startTranslationTimer = (text: string) => {
+    resetTranslationTimer();
+    translationTimer.current = setTimeout(() => {
+      if (text.trim()) {
+        const segmentId = Date.now().toString();
+        setSegments(prevSegments => [...prevSegments, {
+          id: segmentId,
+          original: text.trim(),
+          translated: '',
           timestamp: new Date()
         }]);
-      } catch (error) {
-        console.error('Translation failed:', error);
-      } finally {
-        setIsTranslating(false);
+        translateAsync(text.trim(), segmentId);
+        setCurrentOriginal('');
       }
+    }, config.translationTimeoutMs);
+  };
+
+  const translateAsync = async (text: string, segmentId: string) => {
+    if (pendingTranslations.current.has(segmentId)) {
+      return;
+    }
+
+    pendingTranslations.current.add(segmentId);
+    
+    try {
+      const currentOriginalLang = originalLanguageRef.current;
+      const currentTargetLang = targetLanguageRef.current;
+      
+      const sourceLanguageName = languages.find(l => l.code === currentOriginalLang)?.name || currentOriginalLang;
+      const targetLanguageName = languages.find(l => l.code === currentTargetLang)?.name || currentTargetLang;
+      
+      console.log('=== Translation Request ===');
+      console.log('Source Language Code:', currentOriginalLang);
+      console.log('Target Language Code:', currentTargetLang);
+      console.log('Source Language Name:', sourceLanguageName);
+      console.log('Target Language Name:', targetLanguageName);
+      console.log('Text to translate:', text);
+      
+      const result = await translateText({
+        text,
+        sourceLanguage: sourceLanguageName,
+        targetLanguage: targetLanguageName,
+      });
+
+      console.log('Translation Result:', result.translatedText);
+
+      if (result.error) {
+        console.error('Translation error:', result.error);
+        return;
+      }
+
+      setSegments(prev => 
+        prev.map(seg => 
+          seg.id === segmentId 
+            ? { ...seg, translated: result.translatedText }
+            : seg
+        )
+      );
+
+      console.log('[TranslationApp] TTS enabled:', ttsEnabledRef.current, 'TTS connected:', ttsService.current?.isConnected(), 'Text:', result.translatedText);
+      
+      if (ttsEnabledRef.current && ttsService.current?.isConnected() && result.translatedText) {
+        try {
+          console.log('[TranslationApp] Calling TTS speak for language:', currentTargetLang);
+          await ttsService.current.speak(result.translatedText, currentTargetLang);
+          console.log('[TranslationApp] TTS speak completed');
+        } catch (error) {
+          console.error('[TranslationApp] TTS playback error:', error);
+        }
+      }
+    } catch (error) {
+      console.error('Translation failed:', error);
+    } finally {
+      pendingTranslations.current.delete(segmentId);
+    }
+  };
+
+  const handleEarsMessage = async (message: EarsMessage) => {
+    if (message.type === 'error') {
+      console.error('Ears error:', message.message);
+      return;
+    }
+
+    if (message.type === 'word' && message.word) {
+      setCurrentOriginal(prev => {
+        const newText = prev + ' ' + message.word;
+        
+        if (shouldTriggerTranslation(newText)) {
+          resetTranslationTimer();
+          const segmentId = Date.now().toString();
+          const sentenceText = newText.trim();
+          
+          setSegments(prevSegments => [...prevSegments, {
+            id: segmentId,
+            original: sentenceText,
+            translated: '',
+            timestamp: new Date()
+          }]);
+          
+          translateAsync(sentenceText, segmentId);
+          
+          return '';
+        }
+        
+        startTranslationTimer(newText);
+        return newText;
+      });
+      return;
+    }
+
+    if (message.type === 'final' && message.text) {
+      resetTranslationTimer();
+      const transcribedText = message.text.trim();
+      
+      if (transcribedText) {
+        const segmentId = Date.now().toString();
+        
+        setSegments(prevSegments => [...prevSegments, {
+          id: segmentId,
+          original: transcribedText,
+          translated: '',
+          timestamp: new Date()
+        }]);
+        
+        translateAsync(transcribedText, segmentId);
+      }
+      
+      setCurrentOriginal('');
     }
   };
 
@@ -145,36 +290,177 @@ const TranslationApp = () => {
   };
 
   useEffect(() => {
+    originalLanguageRef.current = originalLanguage;
+  }, [originalLanguage]);
+
+  useEffect(() => {
+    targetLanguageRef.current = targetLanguage;
+  }, [targetLanguage]);
+
+  const initTTS = async () => {
+    console.log('[TranslationApp] Initializing TTS with URL:', config.ttsWebSocketUrl);
+    
+    if (!ttsService.current) {
+      ttsService.current = new TTSService(config.ttsWebSocketUrl);
+    }
+    
+    try {
+      await ttsService.current.connect();
+      setIsTtsConnected(true);
+      console.log('[TranslationApp] Connected to TTS server');
+    } catch (error) {
+      console.error('[TranslationApp] Failed to connect to TTS server:', error);
+      setIsTtsConnected(false);
+    }
+  };
+
+  const toggleTTS = async () => {
+    console.log('[TranslationApp] toggleTTS - current state:', ttsEnabled);
+    
+    if (!ttsEnabled) {
+      await initTTS();
+      setTtsEnabled(true);
+      ttsEnabledRef.current = true;
+      console.log('[TranslationApp] TTS enabled');
+    } else {
+      setTtsEnabled(false);
+      ttsEnabledRef.current = false;
+      if (ttsService.current) {
+        ttsService.current.disconnect();
+        setIsTtsConnected(false);
+      }
+      console.log('[TranslationApp] TTS disabled');
+    }
+  };
+
+  useEffect(() => {
     connectWebSocket();
     
     return () => {
       if (reconnectTimeout.current) {
         clearTimeout(reconnectTimeout.current);
       }
+      resetTranslationTimer();
+      stopAudioCapture();
       if (websocket.current) {
         websocket.current.close();
+      }
+      if (ttsService.current) {
+        ttsService.current.disconnect();
       }
     };
   }, []);
 
-  const toggleListening = () => {
+  useEffect(() => {
+    if (originalScrollRef.current) {
+      originalScrollRef.current.scrollTop = originalScrollRef.current.scrollHeight;
+    }
+  }, [segments, currentOriginal]);
+
+  useEffect(() => {
+    if (translationScrollRef.current) {
+      translationScrollRef.current.scrollTop = translationScrollRef.current.scrollHeight;
+    }
+  }, [segments]);
+
+const resample = (samples: Float32Array, fromRate: number, toRate: number): Float32Array => {
+  if (fromRate === toRate) {
+    return samples;
+  }
+  
+  const ratio = fromRate / toRate;
+  const newLength = Math.round(samples.length / ratio);
+  const result = new Float32Array(newLength);
+  
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = i * ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples.length - 1);
+    const t = srcIndex - srcIndexFloor;
+    
+    result[i] = samples[srcIndexFloor] * (1 - t) + samples[srcIndexCeil] * t;
+  }
+  
+  return result;
+};
+
+const startAudioCapture = async () => {
+  try {
+    if (audioContext.current) {
+      audioContext.current.close();
+    }
+    
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      } 
+    });
+    
+    mediaStream.current = stream;
+    
+    audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    
+    const source = audioContext.current.createMediaStreamSource(mediaStream.current);
+    audioProcessor.current = audioContext.current.createScriptProcessor(4096, 1, 1);
+    
+    audioProcessor.current.onaudioprocess = (e) => {
+      if (websocket.current?.readyState === WebSocket.OPEN) {
+        const inputSamples = e.inputBuffer.getChannelData(0);
+        const inputSampleRate = audioContext.current!.sampleRate;
+        const targetSampleRate = 24000;
+        
+        const resampled = resample(inputSamples, inputSampleRate, targetSampleRate);
+        websocket.current.send(resampled.buffer);
+      }
+    };
+    
+    source.connect(audioProcessor.current);
+    audioProcessor.current.connect(audioContext.current.destination);
+  } catch (error) {
+    console.error('Failed to start audio capture:', error);
+    setIsListening(false);
+  }
+};
+
+  const stopAudioCapture = () => {
+    if (audioProcessor.current) {
+      audioProcessor.current.disconnect();
+      audioProcessor.current = null;
+    }
+    if (mediaStream.current) {
+      mediaStream.current.getTracks().forEach(track => track.stop());
+      mediaStream.current = null;
+    }
+    if (audioContext.current) {
+      audioContext.current.close();
+      audioContext.current = null;
+    }
+  };
+
+  const toggleListening = async () => {
     if (!isConnected) {
+      reconnectAttempts.current = 0;
       connectWebSocket();
       return;
     }
     
     if (isListening) {
+      resetTranslationTimer();
+      stopAudioCapture();
       sendWebSocketMessage({ type: 'stop' });
       setIsListening(false);
     } else {
       setSegments([]);
       setCurrentOriginal('');
-      sendWebSocketMessage({ type: 'start' });
+      await startAudioCapture();
       setIsListening(true);
     }
   };
 
   const clearHistory = () => {
+    resetTranslationTimer();
     setSegments([]);
     setCurrentOriginal('');
   };
@@ -232,6 +518,23 @@ const TranslationApp = () => {
                   disabled 
                   className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-gray-400 text-sm"
                 />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-gray-300">TTS WebSocket Server:</label>
+                <input 
+                  type="text" 
+                  value={config.ttsWebSocketUrl} 
+                  disabled 
+                  className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-gray-400 text-sm"
+                />
+                <div className="flex items-center space-x-2">
+                  <Badge variant={isTtsConnected ? "default" : "secondary"} className="text-xs">
+                    {isTtsConnected ? 'Connected' : 'Disconnected'}
+                  </Badge>
+                  <span className="text-xs text-gray-400">
+                    (Kokorox TTS - Optional)
+                  </span>
+                </div>
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium text-gray-300">Local LLM Model:</label>
@@ -334,7 +637,7 @@ const TranslationApp = () => {
                   <Volume2 className="h-4 w-4" />
                 </Button>
               </div>
-              <div className="h-full overflow-y-auto space-y-4">
+              <div ref={originalScrollRef} className="overflow-y-auto space-y-4 pr-2" style={{ height: 'calc(100% - 3rem)' }}>
                 {segments.map(segment => (
                   <div key={segment.id} className="p-3 bg-gray-700/50 rounded-lg border border-gray-600">
                     <p className="text-gray-100 leading-relaxed">{segment.original}</p>
@@ -359,27 +662,36 @@ const TranslationApp = () => {
             <CardContent className="p-6 h-full">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-semibold text-gray-100">Translation</h3>
-                <Button variant="ghost" size="sm" className="text-gray-400 hover:text-gray-200 hover:bg-gray-700">
-                  <Volume2 className="h-4 w-4" />
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  onClick={toggleTTS}
+                  className={`${
+                    ttsEnabled 
+                      ? 'text-green-400 hover:text-green-300' 
+                      : 'text-gray-400 hover:text-gray-200'
+                  } hover:bg-gray-700`}
+                  title={ttsEnabled ? 'Disable TTS' : 'Enable TTS'}
+                >
+                  {ttsEnabled && isTtsConnected ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
                 </Button>
               </div>
-              <div className="h-full overflow-y-auto space-y-4">
+              <div ref={translationScrollRef} className="overflow-y-auto space-y-4 pr-2" style={{ height: 'calc(100% - 3rem)' }}>
                 {segments.map(segment => (
                   <div key={segment.id} className="p-3 bg-gray-700/50 rounded-lg border border-gray-600">
-                    <p className="text-gray-100 leading-relaxed">{segment.translated}</p>
+                    {segment.translated ? (
+                      <p className="text-gray-100 leading-relaxed">{segment.translated}</p>
+                    ) : (
+                      <div className="flex items-center space-x-2">
+                        <p className="text-gray-400 leading-relaxed">Translating...</p>
+                        <div className="w-1 h-4 bg-gray-300 animate-pulse rounded" />
+                      </div>
+                    )}
                     <p className="text-xs text-gray-400 mt-1 font-mono">
                       {segment.timestamp.toLocaleTimeString()}
                     </p>
                   </div>
                 ))}
-                {isTranslating && (
-                  <div className="p-3 bg-gray-600 rounded-lg border-2 border-gray-500">
-                    <p className="text-gray-100 leading-relaxed">Translating...</p>
-                    <div className="flex items-center mt-2">
-                      <div className="w-1 h-4 bg-gray-300 animate-pulse rounded" />
-                    </div>
-                  </div>
-                )}
               </div>
             </CardContent>
           </Card>

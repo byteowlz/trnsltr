@@ -1,12 +1,13 @@
-import { createOpenAI } from '@ai-sdk/openai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { generateText } from 'ai';
 import { getConfig } from '@/config/app-config';
+import prompts from '@/config/prompts.json';
 
 const config = getConfig();
 
-const openai = createOpenAI({
+const lmstudio = createOpenAICompatible({
+  name: 'lmstudio',
   baseURL: config.localLlmBaseUrl,
-  apiKey: 'not-needed',
 });
 
 export interface TranslationRequest {
@@ -20,20 +21,34 @@ export interface TranslationResponse {
   error?: string;
 }
 
+function interpolatePrompt(template: string, variables: Record<string, string>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] || '');
+}
+
 export async function translateText({
   text,
   sourceLanguage,
   targetLanguage,
 }: TranslationRequest): Promise<TranslationResponse> {
   try {
-    const prompt = `Translate the following text from ${sourceLanguage} to ${targetLanguage}. Only return the translated text, nothing else.
+    const prompt = interpolatePrompt(prompts.translation.user, {
+      sourceLanguage,
+      targetLanguage,
+      text,
+    });
 
-Text to translate: ${text}`;
+    console.log('=== LLM Request ===');
+    console.log('System Prompt:', prompts.translation.system);
+    console.log('User Prompt:', prompt);
 
     const { text: translatedText } = await generateText({
-      model: openai(config.localLlmModel),
+      model: lmstudio(config.localLlmModel),
       prompt,
+      system: prompts.translation.system,
     });
+
+    console.log('=== LLM Response ===');
+    console.log('Translated Text:', translatedText);
 
     return {
       translatedText: translatedText.trim(),

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTS Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 10px 5px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #log {
+            background: #f0f0f0;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 5px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 5px;
+            border-bottom: 1px solid #ddd;
+        }
+        .error { color: red; }
+        .info { color: blue; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Kokorox TTS WebSocket Test</h1>
+    
+    <div>
+        <button onclick="connect()">Connect</button>
+        <button onclick="disconnect()">Disconnect</button>
+        <button onclick="listVoices()">List Voices</button>
+    </div>
+    
+    <div>
+        <input type="text" id="textInput" placeholder="Enter text to synthesize" style="width: 300px; padding: 8px;">
+        <select id="voiceSelect" style="padding: 8px;">
+            <option value="af_sky">af_sky (English)</option>
+            <option value="ef_dora">ef_dora (Spanish)</option>
+            <option value="ff_siwis">ff_siwis (French)</option>
+            <option value="if_sara">if_sara (Italian)</option>
+            <option value="jf_alpha">jf_alpha (Japanese)</option>
+        </select>
+        <button onclick="synthesize()">Synthesize</button>
+    </div>
+    
+    <div id="log"></div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+
+        function log(message, type = 'info') {
+            const logDiv = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+            console.log(message);
+        }
+
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                log('Already connected', 'info');
+                return;
+            }
+
+            const wsUrl = 'ws://localhost:8766';
+            log(`Connecting to ${wsUrl}...`, 'info');
+            
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                log('Connected to TTS server', 'success');
+                ws.send(JSON.stringify({ command: 'list_voices' }));
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                log(`Received: ${message.type}`, 'info');
+                handleMessage(message);
+            };
+
+            ws.onerror = (error) => {
+                log('WebSocket error: ' + error, 'error');
+            };
+
+            ws.onclose = () => {
+                log('Disconnected from TTS server', 'info');
+            };
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+                log('Disconnecting...', 'info');
+            }
+        }
+
+        function listVoices() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected', 'error');
+                return;
+            }
+            ws.send(JSON.stringify({ command: 'list_voices' }));
+            log('Requesting voice list...', 'info');
+        }
+
+        function synthesize() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected', 'error');
+                return;
+            }
+
+            const text = document.getElementById('textInput').value;
+            const voice = document.getElementById('voiceSelect').value;
+
+            if (!text) {
+                log('Please enter text', 'error');
+                return;
+            }
+
+            log(`Setting voice to ${voice}...`, 'info');
+            ws.send(JSON.stringify({ command: 'set_voice', voice }));
+
+            setTimeout(() => {
+                log(`Synthesizing: "${text}"`, 'info');
+                ws.send(JSON.stringify({ command: 'synthesize', text }));
+            }, 500);
+        }
+
+        function handleMessage(message) {
+            switch (message.type) {
+                case 'voices':
+                    log(`Available voices: ${message.voices?.length || 0}`, 'success');
+                    log(`Current voice: ${message.voice}`, 'success');
+                    break;
+
+                case 'voice_changed':
+                    log(`Voice changed to: ${message.voice}`, 'success');
+                    break;
+
+                case 'synthesis_started':
+                    log('Synthesis started', 'success');
+                    audioQueue = [];
+                    break;
+
+                case 'audio_chunk':
+                    log(`Received audio chunk ${message.index + 1}/${message.total}`, 'success');
+                    handleAudioChunk(message.chunk);
+                    break;
+
+                case 'synthesis_completed':
+                    log('Synthesis completed', 'success');
+                    break;
+
+                case 'error':
+                    log('Server error', 'error');
+                    break;
+            }
+        }
+
+        async function handleAudioChunk(base64Chunk) {
+            try {
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    log('AudioContext created', 'info');
+                }
+
+                const binaryString = atob(base64Chunk);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                log(`Decoding ${bytes.length} bytes...`, 'info');
+                const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
+                log(`Decoded audio: ${audioBuffer.duration.toFixed(2)}s`, 'success');
+
+                audioQueue.push(audioBuffer);
+
+                if (!isPlaying) {
+                    playNextChunk();
+                }
+            } catch (error) {
+                log(`Failed to decode audio: ${error.message}`, 'error');
+            }
+        }
+
+        function playNextChunk() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                log('Playback finished', 'success');
+                return;
+            }
+
+            isPlaying = true;
+            const audioBuffer = audioQueue.shift();
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            source.onended = () => {
+                log('Chunk playback ended', 'info');
+                playNextChunk();
+            };
+
+            log('Playing audio chunk...', 'info');
+            source.start(0);
+        }
+    </script>
+</body>
+</html>
