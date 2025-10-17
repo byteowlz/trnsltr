@@ -57,6 +57,8 @@ const TranslationApp = () => {
   const targetLanguageRef = useRef<string>(targetLanguage);
   const ttsService = useRef<TTSService | null>(null);
   const ttsEnabledRef = useRef<boolean>(false);
+  const currentOriginalRef = useRef<string>('');
+  const currentWordsRef = useRef<Array<{ word: string; startTime?: number }>>([]);
   const config = getConfig();
 
   const languages = [
@@ -98,6 +100,7 @@ const TranslationApp = () => {
       websocket.current.onmessage = (event) => {
         try {
           const message: EarsMessage = JSON.parse(event.data);
+          console.log('[WebSocket Message]', message);
           handleEarsMessage(message);
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error);
@@ -152,19 +155,22 @@ const TranslationApp = () => {
     }
   };
 
-  const startTranslationTimer = (text: string) => {
+  const startTranslationTimer = () => {
     resetTranslationTimer();
     translationTimer.current = setTimeout(() => {
-      if (text.trim()) {
+      const text = currentOriginalRef.current.trim();
+      if (text) {
         const segmentId = Date.now().toString();
         setSegments(prevSegments => [...prevSegments, {
           id: segmentId,
-          original: text.trim(),
+          original: text,
           translated: '',
           timestamp: new Date()
         }]);
-        translateAsync(text.trim(), segmentId);
+        translateAsync(text, segmentId);
         setCurrentOriginal('');
+        currentOriginalRef.current = '';
+        currentWordsRef.current = [];
       }
     }, config.translationTimeoutMs);
   };
@@ -236,49 +242,88 @@ const TranslationApp = () => {
     }
 
     if (message.type === 'word' && message.word) {
-      setCurrentOriginal(prev => {
-        const newText = prev + ' ' + message.word;
-        
-        if (shouldTriggerTranslation(newText)) {
-          resetTranslationTimer();
-          const segmentId = Date.now().toString();
-          const sentenceText = newText.trim();
-          
-          setSegments(prevSegments => [...prevSegments, {
+      const words = [...currentWordsRef.current];
+      const startTime = message.start_time;
+      const existingIndex =
+        typeof startTime === 'number'
+          ? words.findIndex(word => word.startTime === startTime)
+          : -1;
+
+      if (existingIndex !== -1) {
+        words[existingIndex] = { word: message.word, startTime };
+      } else {
+        words.push({ word: message.word, startTime });
+      }
+
+      currentWordsRef.current = words;
+
+      const newText = words
+        .map(word => word.word)
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+
+      currentOriginalRef.current = newText;
+      setCurrentOriginal(newText);
+
+      if (!newText) {
+        return;
+      }
+
+      if (shouldTriggerTranslation(newText)) {
+        resetTranslationTimer();
+
+        const segmentId = Date.now().toString();
+        setSegments(prevSegments => [
+          ...prevSegments,
+          {
             id: segmentId,
-            original: sentenceText,
+            original: newText,
             translated: '',
             timestamp: new Date()
-          }]);
-          
-          translateAsync(sentenceText, segmentId);
-          
-          return '';
-        }
-        
-        startTranslationTimer(newText);
-        return newText;
-      });
+          }
+        ]);
+
+        translateAsync(newText, segmentId);
+        setCurrentOriginal('');
+        currentOriginalRef.current = '';
+        currentWordsRef.current = [];
+        return;
+      }
+
+      startTranslationTimer();
       return;
     }
 
-    if (message.type === 'final' && message.text) {
+    if (message.type === 'final') {
       resetTranslationTimer();
-      const transcribedText = message.text.trim();
-      
-      if (transcribedText) {
+
+      const textFromMessage = message.text?.trim() ?? '';
+      const wordsText = message.words
+        ? message.words.map(word => word.word).join(' ').trim()
+        : '';
+      const currentText = currentOriginalRef.current.trim();
+
+      const textToTranslate = (textFromMessage || wordsText || currentText).trim();
+
+      if (textToTranslate) {
         const segmentId = Date.now().toString();
-        
-        setSegments(prevSegments => [...prevSegments, {
-          id: segmentId,
-          original: transcribedText,
-          translated: '',
-          timestamp: new Date()
-        }]);
-        
-        translateAsync(transcribedText, segmentId);
+
+        setSegments(prevSegments => [
+          ...prevSegments,
+          {
+            id: segmentId,
+            original: textToTranslate,
+            translated: '',
+            timestamp: new Date()
+          }
+        ]);
+
+        translateAsync(textToTranslate, segmentId);
       }
-      
+
+      currentWordsRef.current = [];
+      currentOriginalRef.current = '';
       setCurrentOriginal('');
     }
   };
@@ -291,6 +336,9 @@ const TranslationApp = () => {
 
   useEffect(() => {
     originalLanguageRef.current = originalLanguage;
+    if (isListening && isConnected) {
+      sendWebSocketMessage({ type: 'setlanguage', lang: originalLanguage });
+    }
   }, [originalLanguage]);
 
   useEffect(() => {
@@ -448,12 +496,17 @@ const startAudioCapture = async () => {
     
     if (isListening) {
       resetTranslationTimer();
+      currentOriginalRef.current = '';
+      currentWordsRef.current = [];
       stopAudioCapture();
       sendWebSocketMessage({ type: 'stop' });
       setIsListening(false);
     } else {
       setSegments([]);
       setCurrentOriginal('');
+      currentOriginalRef.current = '';
+      currentWordsRef.current = [];
+      sendWebSocketMessage({ type: 'setlanguage', lang: originalLanguageRef.current });
       await startAudioCapture();
       setIsListening(true);
     }
@@ -463,6 +516,8 @@ const startAudioCapture = async () => {
     resetTranslationTimer();
     setSegments([]);
     setCurrentOriginal('');
+    currentOriginalRef.current = '';
+    currentWordsRef.current = [];
   };
 
   return (

@@ -1,6 +1,6 @@
 {
   "translation": {
-    "system": "You are a professional translator. Translate text accurately while preserving tone, style, and context.",
-    "user": "Translate the following text from {{sourceLanguage}} to {{targetLanguage}}. Only return the translated text, nothing else.\n\nText to translate: {{text}}"
+    "system": "You are a professional translator. Translate text accurately while preserving tone, style, and context. You only return the translation and nothing else!",
+    "user": "Translate the following text from {{sourceLanguage}} to {{targetLanguage}}. Only return the translated text, nothing else (no explainations etc).\n\nText to translate: {{text}}"
   }
 }
