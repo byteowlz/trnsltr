@@ -526,12 +526,10 @@ const startAudioCapture = async () => {
         <div className="max-w-7xl mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3">
-              <div className="p-2 bg-gray-700 rounded-lg">
-                <Languages className="h-6 w-6 text-gray-100" />
-              </div>
+              <img src="/trnsltr_logo_white.svg" alt="trnsltr" className="h-10 w-10" />
               <div>
-                <h1 className="text-2xl font-bold text-gray-100">RealTime Translator</h1>
-                <p className="text-sm text-gray-400">Live speech translation</p>
+                <h1 className="text-2xl font-bold text-gray-100">trnsltr</h1>
+                <p className="text-sm text-gray-400">Real-time speech translation</p>
               </div>
             </div>
             
