@@ -1,3 +1,5 @@
+![banner](trnsltr_logo_banner_black.png)
+
 # Real-Time Translator
 
 A real-time speech-to-text translation application that uses the eaRS websocket server for speech recognition, AI SDK with local LLM for translation, and optional Kokorox TTS for audio playback.
@@ -12,9 +14,9 @@ A real-time speech-to-text translation application that uses the eaRS websocket 
 ## Prerequisites
 
 - Bun package manager
-- eaRS websocket server running (https://github.com/byteowlz/eaRS)
-- Ollama with a model installed (e.g., llama3.2)
-- Kokorox websocket server (optional, for TTS - https://github.com/WismutHansen/kokorox)
+- eaRS websocket server running (<https://github.com/byteowlz/eaRS>)
+- Local LLM engine serving a model via an openai-compatible API endpoint (e.g., llama-cpp with qwen3)
+- Kokorox websocket server (optional, for TTS - <https://github.com/WismutHansen/kokorox>)
 
 ## Setup
 
@@ -68,7 +70,7 @@ cargo build --release
 
 ### 3. Install Ollama (Translation)
 
-Download and install Ollama from https://ollama.ai
+Download and install Ollama from <https://ollama.ai>
 
 ```bash
 # Install a model
@@ -144,7 +146,7 @@ cd trnsltr
 bun dev
 ```
 
-Open your browser to http://localhost:5173 and click the microphone button to start translating.
+Open your browser to <http://localhost:5173> and click the microphone button to start translating.
 
 ## eaRS WebSocket Protocol
 
@@ -194,6 +196,7 @@ The application supports optional text-to-speech playback using Kokorox TTS. Cli
 Kokorox accepts JSON commands and streams back audio chunks:
 
 **Commands:**
+
 ```json
 {"command": "synthesize", "text": "Hello world", "language": "en-us"}
 {"command": "set_voice", "voice": "af_sky"}
@@ -201,6 +204,7 @@ Kokorox accepts JSON commands and streams back audio chunks:
 ```
 
 **Responses:**
+
 ```json
 {"type": "audio_chunk", "chunk": "base64_encoded_wav", "index": 0, "total": 1}
 {"type": "synthesis_completed"}
@@ -209,6 +213,7 @@ Kokorox accepts JSON commands and streams back audio chunks:
 ### Supported Languages
 
 Languages are auto-detected based on target language:
+
 - English (en): af_sky
 - Spanish (es): ef_dora
 - French (fr): ff_siwis
@@ -228,7 +233,7 @@ View all available voices: `koko voices`
 
 ## Additional Resources
 
-- eaRS Documentation: https://github.com/byteowlz/eaRS/blob/main/WEBSOCKET.md
-- Kokorox Documentation: https://github.com/WismutHansen/kokorox
+- eaRS Documentation: <https://github.com/byteowlz/eaRS/blob/main/WEBSOCKET.md>
+- Kokorox Documentation: <https://github.com/WismutHansen/kokorox>
 - See `WEBSOCKET_STT.md` for detailed eaRS integration
 - See `WEBSOCKET_TTS.md` for detailed Kokorox integration
